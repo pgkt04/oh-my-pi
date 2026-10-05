@@ -11,7 +11,7 @@ export function isInsideHerdr(env: NodeJS.ProcessEnv = Bun.env): boolean {
 }
 
 /** Terminal multiplexers omp recognizes as owning the screen grid. */
-export type TerminalMultiplexer = "herdr" | "tmux" | "screen" | "zellij" | "cmux" | "wmux";
+export type TerminalMultiplexer = "herdr" | "tmux" | "screen" | "zellij" | "rmux" | "cmux" | "wmux";
 
 /**
  * Classify which terminal multiplexer owns the current screen grid, or `null`
@@ -25,6 +25,9 @@ export type TerminalMultiplexer = "herdr" | "tmux" | "screen" | "zellij" | "cmux
  * overrides and can be set outside a CMUX/WMUX terminal. wmux is a Windows
  * multiplexer (Electron + xterm.js) modeled on cmux/herdr that repaints its
  * pane in place and exports WMUX=1 plus a native WMUX_SURFACE_ID.
+ * rmux's explicit TERM_PROGRAM identifies its broker endpoint while preserving
+ * its configured tmux/screen terminfo; inherited broker permission alone never
+ * overrides an inner mux's session markers or TERM fallback.
  */
 export function classifyTerminalMultiplexer(env: NodeJS.ProcessEnv = Bun.env): TerminalMultiplexer | null {
 	if (isInsideHerdr(env)) return "herdr";
@@ -34,12 +37,27 @@ export function classifyTerminalMultiplexer(env: NodeJS.ProcessEnv = Bun.env): T
 	if (env.CMUX_WORKSPACE_ID || env.CMUX_SURFACE_ID || env.CMUX_REMOTE_TRANSPORT) return "cmux";
 	if (env.WMUX === "1" || env.WMUX_SURFACE_ID) return "wmux";
 	const term = env.TERM?.toLowerCase() ?? "";
+	const program = env.TERM_PROGRAM?.toLowerCase() ?? "";
+	if (program === "tmux") return "tmux";
+	if (program === "screen") return "screen";
+	if (program === "zellij" || term.startsWith("zellij")) return "zellij";
+	// rmux deliberately keeps a tmux/screen terminfo name. Its explicit pane
+	// identity beats that fallback, but never an inner multiplexer's markers.
+	if (program === "rmux") return "rmux";
 	if (term.startsWith("tmux")) return "tmux";
 	if (term.startsWith("screen")) return "screen";
+	if (env.RMUX || env.RMUX_PANE || env.RMUX_TSP === "1") return "rmux";
 	return null;
 }
 
 /** True when a terminal multiplexer owns the current screen grid. */
 export function isInsideTerminalMultiplexer(env: NodeJS.ProcessEnv = Bun.env): boolean {
 	return classifyTerminalMultiplexer(env) !== null;
+}
+
+/** Permit APC detection only for a direct terminal or the explicit rmux broker endpoint. */
+export function canProbeTsp(env: NodeJS.ProcessEnv = Bun.env): boolean {
+	const multiplexer = classifyTerminalMultiplexer(env);
+	if (multiplexer === null) return true;
+	return multiplexer === "rmux" && env.RMUX_TSP === "1" && env.TERM_PROGRAM?.toLowerCase() === "rmux";
 }

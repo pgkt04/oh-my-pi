@@ -108,6 +108,43 @@ describe("TSP hello probe", () => {
 		}
 	});
 
+	it("keeps superseded DA1 owners from resolving the runtime probe", () => {
+		const { terminal, hellos } = setup();
+		try {
+			terminal.probeTsp(7);
+			process.stdin.emit("data", HELLO_REPLY);
+			expect(hellos).toEqual([]);
+			for (let i = 0; i < 10 && terminal.tspProbePending; i++) process.stdin.emit("data", DA1_REPLY);
+			expect(hellos).toEqual([null]);
+		} finally {
+			terminal.stop();
+		}
+	});
+
+	it("keeps broker control readable in ANSI and reports the initial private epoch", () => {
+		const saved = { ...Bun.env };
+		for (const key of Object.keys(Bun.env))
+			if (/^(TMUX|STY|ZELLIJ|HERDR_|CMUX_|WMUX|RMUX)/.test(key)) delete Bun.env[key];
+		Bun.env.TERM_PROGRAM = "rmux";
+		Bun.env.RMUX_TSP = "1";
+		const { terminal, hellos, received } = setup();
+		const controls: number[] = [];
+		terminal.onRmuxControl(message => controls.push(message.epoch));
+		try {
+			process.stdin.emit("data", '\x1b_tsp;r;{"r":"rmux-probe","epoch":4,"native":false}\x1b\\');
+			for (let i = 0; i < 10 && terminal.tspProbePending; i++) process.stdin.emit("data", DA1_REPLY);
+			expect(hellos).toEqual([null]);
+			expect(terminal.rmuxEpoch).toBe(4);
+			process.stdin.emit("data", '\x1b_tsp;e;{"ev":"rmux-view","epoch":5,"reason":"viewers"}\x1b\\');
+			expect(controls).toEqual([5]);
+			expect(received).toEqual([]);
+		} finally {
+			terminal.stop();
+			for (const key of Object.keys(Bun.env)) if (!(key in saved)) delete Bun.env[key];
+			Object.assign(Bun.env, saved);
+		}
+	});
+
 	it("expects TSP from TERM_PROGRAM=tern, except inside a multiplexer or with PI_TUI_NATIVE=0", () => {
 		const saved = { ...Bun.env };
 		try {

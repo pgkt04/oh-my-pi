@@ -116,6 +116,26 @@ export class TspTestTerminal implements Terminal {
 	#inbox: string[] = [];
 	#chunks = new Map<string, string>();
 	#open: string[] = [];
+	rmuxEpoch: number | undefined;
+	#rmuxCallbacks: ((message: { kind: "view" | "ready"; epoch: number; accepted?: boolean }) => void)[] = [];
+
+	onRmuxControl(callback: (message: { kind: "view" | "ready"; epoch: number; accepted?: boolean }) => void): void {
+		this.#rmuxCallbacks.push(callback);
+	}
+
+	brokerView(epoch: number): void {
+		for (const callback of this.#rmuxCallbacks) callback({ kind: "view", epoch });
+	}
+
+	brokerReady(epoch: number, accepted = true): void {
+		for (const callback of this.#rmuxCallbacks) callback({ kind: "ready", epoch, accepted });
+	}
+
+	probeTsp(epoch: number): void {
+		this.rmuxEpoch = epoch;
+		this.#pending = true;
+		this.#helloResult = undefined;
+	}
 
 	constructor(options: TspHarnessOptions) {
 		this.#options = options;

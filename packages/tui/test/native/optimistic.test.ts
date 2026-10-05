@@ -95,9 +95,10 @@ describe("optimistic native start (TERM_PROGRAM=tern)", () => {
 		const silent = harness;
 		silent.flush(999);
 		expect(isNativeRendering()).toBe(true);
+		const surface = silent.terminal.surface;
 		silent.flush(1000);
 		expect(isNativeRendering()).toBe(false);
-		expect(silent.terminal.log.at(-1)).toEqual({ verb: "x", body: { id: "s:1", keep: false } });
+		expect(silent.terminal.log.at(-1)).toEqual({ verb: "x", body: { id: surface, keep: false } });
 		expect(silent.terminal.surface).toBeUndefined();
 		expect(silent.terminal.rowBytes).toContain("rows: silent");
 	});

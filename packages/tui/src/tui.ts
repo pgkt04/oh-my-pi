@@ -1442,6 +1442,25 @@ export class TUI extends Container {
 			this.requestRender(true);
 		});
 		this.terminal.onTspHello?.(hello => this.#onTspHello(hello));
+		this.terminal.onRmuxControl?.(message => {
+			if (this.#stopped) return;
+			if (message.kind === "ready") {
+				if (message.epoch !== this.#rmuxTransitionEpoch) return;
+				this.#rmuxAwaitingReady = false;
+				if (message.accepted && this.#rmuxQueuedEpoch === undefined) {
+					this.#rmuxQuiescent = false;
+					this.requestRender();
+				} else if (this.#rmuxQueuedEpoch !== undefined) {
+					const epoch = this.#rmuxQueuedEpoch;
+					this.#rmuxQueuedEpoch = undefined;
+					this.#switchRmux(epoch);
+				}
+				return;
+			}
+			if (message.epoch <= (this.#rmuxTransitionEpoch ?? -1)) return;
+			if (this.#rmuxQuiescent && this.#rmuxAwaitingReady) this.#rmuxQueuedEpoch = message.epoch;
+			else this.#switchRmux(message.epoch);
+		});
 		this.terminal.start(
 			data => this.#handleInput(data),
 			() => {
@@ -1552,6 +1571,8 @@ export class TUI extends Container {
 			this.#runScheduledRender();
 		}
 		this.#native!.stop();
+		this.#nativeLive = false;
+		this.#nativeClosed = true;
 	}
 
 	/** Reference document the TSP terminal should hold (debug mirror only). */
@@ -1559,6 +1580,7 @@ export class TUI extends Container {
 		return this.#nativeLive ? this.#native?.document() : undefined;
 	}
 
+	#nativeClosed = false;
 	/** Most recent TSP frames sent (debug mirror only). */
 	getNativeFrames(count?: number): readonly TspFrame[] {
 		return this.#native?.recentFrames(count) ?? [];
@@ -1569,11 +1591,65 @@ export class TUI extends Container {
 		return this.#native?.fallbackCount ?? 0;
 	}
 
+	#rmuxTransitionEpoch: number | undefined;
+	#rmuxQueuedEpoch: number | undefined;
+	#rmuxQuiescent = false;
+	#rmuxInitialPaint = false;
+	#rmuxAwaitingReady = false;
+
+	#switchRmux(epoch: number): void {
+		this.#rmuxTransitionEpoch = epoch;
+		this.#rmuxQuiescent = true;
+		this.#rmuxAwaitingReady = true;
+		this.#renderTimer?.cancel();
+		this.#renderRequested = false;
+		this.#clearNativeConfirm();
+		this.#native?.stop(false);
+		this.#native = undefined;
+		this.#nativeLive = false;
+		this.#nativeHoldTimer?.cancel();
+		this.#nativeHoldTimer = undefined;
+		this.terminal.probeTsp?.(epoch);
+	}
+
+	#paintRmuxRenderer(hello: TspHello | null, epoch: number): void {
+		this.#rmuxTransitionEpoch = epoch;
+		this.#rmuxQuiescent = true;
+		this.#rmuxAwaitingReady = true;
+		this.#native?.stop(false);
+		this.#native = undefined;
+		this.#nativeLive = false;
+		if (hello !== null) this.#startNative(hello);
+		else {
+			this.#previousFrameLength = 0;
+			this.#providerWindow = [];
+			this.#providerPreparedRows = [];
+			this.#providerViewportTop = 0;
+			this.#providerViewportPadTop = 0;
+			this.#forgetHardwareCursorState();
+			this.invalidate();
+		}
+		this.#rmuxInitialPaint = true;
+		try {
+			this.renderNow({ clearScrollback: true });
+		} finally {
+			this.#rmuxInitialPaint = false;
+		}
+		this.terminal.write(
+			`${TSP_PREFIX}q;${JSON.stringify({ q: "rmux-ready", epoch, renderer: hello ? "native" : "ansi" })}\x1b\\`,
+		);
+	}
 	#onTspHello(hello: TspHello | null): void {
 		const held = this.#nativeHoldTimer !== undefined;
 		this.#nativeHoldTimer?.cancel();
 		this.#nativeHoldTimer = undefined;
 		if (this.#stopped) return;
+		const epoch = this.terminal.rmuxEpoch;
+		if (epoch !== undefined) {
+			if (hello !== null && (hello.rmux?.broker !== 1 || hello.rmux.epoch !== epoch)) hello = null;
+			this.#paintRmuxRenderer(hello, epoch);
+			return;
+		}
 		if (this.#nativeUnconfirmed) {
 			if (hello === null) {
 				this.#revokeNative("the DA1 sentinel came before a TSP hello reply, or the reply's version is unsupported");
@@ -2439,7 +2515,8 @@ export class TUI extends Container {
 		this.#nativeHoldTimer?.cancel();
 		this.#nativeHoldTimer = undefined;
 		this.#clearNativeConfirm();
-		const nativeWasLive = this.#nativeLive;
+		const nativeWasLive = this.#nativeLive || this.#nativeClosed;
+		this.#nativeClosed = false;
 		if (nativeWasLive) {
 			this.#native!.stop();
 			this.#nativeLive = false;
@@ -3523,6 +3600,7 @@ export class TUI extends Container {
 	/** Render one frame: alt-screen modal, provider plan, or children fallback. */
 	#doRender(): void {
 		if (this.#stopped) return;
+		if (this.#rmuxQuiescent && !this.#rmuxInitialPaint) return;
 		if (this.#nativeLive) {
 			this.#native!.render();
 			return;

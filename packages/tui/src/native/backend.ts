@@ -111,10 +111,12 @@ const DEFAULT_SCHEDULER: RenderScheduler = {
 
 /** Frames kept for the debug `tsp` op. */
 const RECENT_FRAMES = 64;
-/** An unanswered frame older than this no longer holds rendering back. */
+/** Outside strict broker flow control, an unanswered frame eventually stops holding rendering back. */
 const STALLED_ACK_MS = 5000;
 /** Role of the session's surfaces; a screen page may name its own. */
 const SESSION_ROLE = "omp.session";
+/** Replacement backends must not reuse a surface addressed by late events or draw acknowledgements. */
+let nextSurfaceId = 1;
 
 class NativeContext implements DescribeContext {
 	cols: number;
@@ -240,7 +242,6 @@ export class NativeBackend {
 	#reader = new TspReader();
 	#inline: Surface;
 	#screen: Surface | null = null;
-	#nextSurface = 1;
 	#mirror: boolean;
 	#recordPath: string | undefined;
 	#stats: boolean;
@@ -360,6 +361,8 @@ export class NativeBackend {
 	stop(keep = true): void {
 		if (!this.#live) return;
 		this.#live = false;
+		this.#clearStallTimer();
+		this.#reader = new TspReader();
 		if (this.#screen) this.#close(this.#screen, false);
 		this.#screen = null;
 		this.#close(this.#inline, keep);
@@ -368,7 +371,6 @@ export class NativeBackend {
 		this.#unbindTheme?.();
 		this.#unbindTheme = undefined;
 		this.#useNerdSymbols(false);
-		this.#clearStallTimer();
 	}
 
 	/**
@@ -408,6 +410,7 @@ export class NativeBackend {
 		const sawResize = this.#sawResize;
 		this.#hello = hello;
 		this.#applyHello(hello);
+		if (hello.rmux?.strictCredits === true) this.#clearStallTimer();
 		if (sawResize) {
 			this.#cx.cols = before.cols;
 			this.#sawResize = true;
@@ -502,6 +505,7 @@ export class NativeBackend {
 	handleInput(sequence: string): boolean {
 		const raw = splitTspMessage(sequence);
 		if (!raw) return false;
+		if (!this.#live) return true;
 		this.#record("in", raw.verb, raw.params, raw.body);
 		const message = this.#reader.feed(sequence);
 		if (message?.verb === "e") this.#handleEvent(message.event);
@@ -526,7 +530,7 @@ export class NativeBackend {
 	}
 
 	#newSurface(mode: "inline" | "screen", role = SESSION_ROLE): Surface {
-		return new Surface(`s:${this.#nextSurface++}`, mode, role, this.#mirror);
+		return new Surface(`s:${nextSurfaceId++}`, mode, role, this.#mirror);
 	}
 
 	#open(surface: Surface): void {
@@ -536,10 +540,14 @@ export class NativeBackend {
 
 	#close(surface: Surface, keep: boolean): void {
 		this.#write("x", { id: surface.id, keep });
+		surface.unacked.length = 0;
+		surface.acked = surface.seq;
+		surface.dirty = false;
 	}
 
 	#hasCredit(surface: Surface): boolean {
 		if (surface.unacked.length < this.#credits) return true;
+		if (this.#hello.rmux?.strictCredits === true) return false;
 		const oldest = surface.unacked[0]!;
 		if (this.#scheduler.now() - oldest < STALLED_ACK_MS) return false;
 		logger.warn("TSP: terminal stopped acknowledging frames; resuming without credits", {
@@ -554,12 +562,12 @@ export class NativeBackend {
 
 	/** Render again once `surface`'s oldest unacked frame counts as stalled, in case no ack ever arrives. */
 	#armStallTimer(surface: Surface): void {
-		if (this.#stallTimer) return;
+		if (this.#hello.rmux?.strictCredits === true || this.#stallTimer) return;
 		const delay = surface.unacked[0]! + STALLED_ACK_MS - this.#scheduler.now();
 		this.#stallTimer = this.#scheduler.scheduleRender(
 			() => {
 				this.#stallTimer = undefined;
-				this.#host.requestRender();
+				if (this.#live) this.#host.requestRender();
 			},
 			Math.max(0, delay),
 		);

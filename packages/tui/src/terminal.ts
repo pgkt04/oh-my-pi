@@ -29,6 +29,7 @@ import {
 } from "./terminal-capabilities";
 import { isInsideTmux, wrapTmuxPassthrough } from "./tmux";
 import { setHangulCompatibilityJamoWidth } from "./utils";
+import { canProbeTsp } from "./terminal-multiplexer";
 import { translateWindowsAltGrSequence } from "./windows-altgr";
 import { Win32InputModeDecoder, Win32PasteMarkerNormalizer } from "./windows-input-mode";
 
@@ -662,6 +663,9 @@ export interface Terminal {
 	 * Terminals built against older pi-tui versions keep working.
 	 */
 	onTspHello?(callback: TspHelloHandler): void;
+	onRmuxControl?(callback: (message: { kind: "view" | "ready"; epoch: number; accepted?: boolean }) => void): void;
+	probeTsp?(epoch: number): void;
+	readonly rmuxEpoch?: number;
 	/** True while the `hello` probe awaits its reply or DA1 sentinel. */
 	readonly tspProbePending?: boolean;
 	/**
@@ -694,7 +698,7 @@ type Da1SentinelOwner =
 	| { kind: "privateMode"; mode: number }
 	| { kind: "osc99Probe"; id: string }
 	| { kind: "glyphProtocol"; phase: "support" | "confirm" }
-	| { kind: "tsp" };
+	| { kind: "tsp"; generation: number };
 
 let nextOsc99ProbeId = 1;
 
@@ -849,6 +853,11 @@ export class ProcessTerminal implements Terminal {
 	#tspResult: TspHello | null | undefined;
 	#tspCallbacks: TspHelloHandler[] = [];
 	#tspReplyBuffer = "";
+	#tspGeneration = 0;
+	#tspDeadline: Timer | undefined;
+	#rmuxEpoch: number | undefined;
+	#rmuxRequestedEpoch: number | undefined;
+	#rmuxCallbacks: ((message: { kind: "view" | "ready"; epoch: number; accepted?: boolean }) => void)[] = [];
 	#privateCsiResponseBuffer = "";
 	#da1SentinelOwners: Da1SentinelOwner[] = [];
 	/** Resolved DECRQM support per private mode (mode → supported). */
@@ -963,6 +972,20 @@ export class ProcessTerminal implements Terminal {
 	onTspHello(callback: TspHelloHandler): void {
 		this.#tspCallbacks.push(callback);
 		if (this.#tspResult !== undefined) callback(this.#tspResult);
+	}
+
+	onRmuxControl(callback: (message: { kind: "view" | "ready"; epoch: number; accepted?: boolean }) => void): void {
+		this.#rmuxCallbacks.push(callback);
+	}
+
+	get rmuxEpoch(): number | undefined {
+		return this.#rmuxEpoch;
+	}
+
+	probeTsp(epoch: number): void {
+		this.#rmuxRequestedEpoch = epoch;
+		this.#rmuxEpoch = epoch;
+		this.#queryTspSupport();
 	}
 
 	get tspProbePending(): boolean {
@@ -1440,7 +1463,7 @@ export class ProcessTerminal implements Terminal {
 					}
 					case "tsp": {
 						// DA1 before any `tsp;r` reply: the terminal doesn't speak TSP.
-						this.#resolveTspSupport(null);
+						if (owner.generation === this.#tspGeneration) this.#resolveTspSupport(null);
 						break;
 					}
 				}
@@ -1776,13 +1799,14 @@ export class ProcessTerminal implements Terminal {
 	#shouldQueryTspSupport(): boolean {
 		const override = $env.PI_TUI_NATIVE;
 		if (override === "0") return false;
+		if (!canProbeTsp($env)) return false;
 		if (override === "1") return true;
-		// Multiplexers swallow APC, so the reply could never arrive.
-		if (isInsideTerminalMultiplexer($env)) return false;
 		return !isBunTestRuntime();
 	}
 
 	#queryTspSupport(): void {
+		clearTimeout(this.#tspDeadline);
+		const generation = ++this.#tspGeneration;
 		this.#tspPending = false;
 		this.#tspResult = undefined;
 		this.#tspReplyBuffer = "";
@@ -1793,12 +1817,44 @@ export class ProcessTerminal implements Terminal {
 			return;
 		}
 		this.#tspPending = true;
-		this.#da1SentinelOwners.push({ kind: "tsp" });
-		this.#safeWrite(`${encodeTspHelloQuery()}\x1b[c`);
+		this.#da1SentinelOwners.push({ kind: "tsp", generation });
+		this.#safeWrite(`${encodeTspHelloQuery(undefined, this.#rmuxRequestedEpoch)}\x1b[c`);
+		this.#tspDeadline = setTimeout(() => {
+			if (generation === this.#tspGeneration) this.#resolveTspSupport(null);
+		}, 1000);
 	}
 
 	#handleTspMessage(sequence: string): void {
 		const message = parseTspMessage(sequence);
+		const owner = this.#da1SentinelOwners.find(owner => owner.kind === "tsp");
+		if (
+			message?.verb === "r" &&
+			(message.reply.r === "hello" || message.reply.r === "rmux-probe") &&
+			owner?.kind === "tsp" &&
+			owner.generation !== this.#tspGeneration
+		)
+			return;
+		if ($env.RMUX_TSP === "1" && canProbeTsp($env)) {
+			if (message?.verb === "r" && message.reply.r === "rmux-probe") {
+				const reply = message.reply;
+				if (
+					this.#tspPending &&
+					reply.accepted !== false &&
+					(this.#rmuxRequestedEpoch === undefined || reply.epoch === this.#rmuxRequestedEpoch)
+				)
+					this.#rmuxEpoch = reply.epoch;
+				return;
+			}
+			if (message?.verb === "r" && message.reply.r === "rmux-ready") {
+				for (const cb of this.#rmuxCallbacks)
+					cb({ kind: "ready", epoch: message.reply.epoch, accepted: message.reply.accepted });
+				return;
+			}
+			if (message?.verb === "e" && message.event.ev === "rmux-view") {
+				for (const cb of this.#rmuxCallbacks) cb({ kind: "view", epoch: message.event.epoch });
+				return;
+			}
+		}
 		if (message?.verb === "r") {
 			if (message.reply.r === "hello") this.#resolveTspSupport(message.reply);
 			return;
@@ -1808,8 +1864,11 @@ export class ProcessTerminal implements Terminal {
 
 	#resolveTspSupport(hello: TspHello | null): void {
 		if (!this.#tspPending) return;
+		clearTimeout(this.#tspDeadline);
+		this.#tspDeadline = undefined;
 		this.#tspPending = false;
-		const result = hello !== null && hello.v === TSP_VERSION ? hello : null;
+		const validEpoch = this.#rmuxRequestedEpoch === undefined || hello?.rmux?.epoch === this.#rmuxRequestedEpoch;
+		const result = hello !== null && hello.v === TSP_VERSION && validEpoch ? hello : null;
 		if (hello !== null && result === null) logger.warn("TSP: unsupported protocol version", { v: hello.v });
 		this.#tspResult = result;
 		for (const cb of this.#tspCallbacks) {
@@ -2200,6 +2259,11 @@ export class ProcessTerminal implements Terminal {
 		this.#tspResult = undefined;
 		this.#tspReplyBuffer = "";
 		this.#tspCallbacks = [];
+		clearTimeout(this.#tspDeadline);
+		this.#tspDeadline = undefined;
+		this.#rmuxCallbacks = [];
+		this.#rmuxEpoch = undefined;
+		this.#rmuxRequestedEpoch = undefined;
 		this.#privateCsiResponseBuffer = "";
 		this.#inBandResizeBuffer = "";
 		this.#da1SentinelOwners.length = 0;

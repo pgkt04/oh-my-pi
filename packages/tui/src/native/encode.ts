@@ -15,6 +15,7 @@ import {
 	TSP_VERSION,
 	type TspEvent,
 	type TspReply,
+	type TspRmuxRenderer,
 	type TspVerb,
 } from "@oh-my-pi/pi-wire";
 
@@ -46,24 +47,29 @@ function codePointBytes(text: string, i: number): { bytes: number; units: number
 	return { bytes: 3, units: 1 };
 }
 
-/** Split `body` into pieces of at most `limit` UTF-8 bytes, never inside a code point. */
+/** Split within the UTF-8 limit, without code-point splits or parameter-shaped chunk prefixes. */
 export function splitUtf8(body: string, limit: number): string[] {
 	const max = Math.max(4, Math.trunc(limit));
 	const pieces: string[] = [];
 	let start = 0;
-	let bytes = 0;
-	let i = 0;
-	while (i < body.length) {
-		const step = codePointBytes(body, i);
-		if (bytes + step.bytes > max) {
-			pieces.push(body.slice(start, i));
-			start = i;
-			bytes = 0;
+	do {
+		let end = start;
+		let bytes = 0;
+		let semi = -1;
+		while (end < body.length) {
+			const step = codePointBytes(body, end);
+			if (bytes + step.bytes > max) break;
+			if (semi === -1 && body.charCodeAt(end) === 0x3b) semi = end;
+			bytes += step.bytes;
+			end += step.units;
 		}
-		bytes += step.bytes;
-		i += step.units;
-	}
-	pieces.push(body.slice(start));
+		// Every chunk gets parameter lookahead independently. If its first
+		// segment would be swallowed as k=v, put that semicolon in the next
+		// chunk: no semicolon means body, and a leading semicolon is always safe.
+		if (semi > start && PARAM_PATTERN.test(body.slice(start, semi))) end = semi;
+		pieces.push(body.slice(start, end));
+		start = end;
+	} while (start < body.length);
 	return pieces;
 }
 
@@ -113,15 +119,22 @@ export function encodeTspJson(verb: TspVerb, value: unknown, params?: TspParams,
  * without it, every key stays omp's. `"undo"` says omp applies `undo` events,
  * so the terminal may turn ⌃Z in a field into one.
  * `"send"` accepts an explicit prompt for a live composer without simulating keys.
+ * `"rmux-reprobe"` opts into the rmux extension's epoch-based renderer transitions.
  */
-export function encodeTspHelloQuery(version?: string): string {
+export function encodeTspHelloQuery(version?: string, rmuxEpoch?: number): string {
 	return encodeTspJson("q", {
 		q: "hello",
 		v: [TSP_VERSION],
 		app: "omp",
-		features: ["edit", "undo", "send"],
+		features: ["edit", "undo", "send", "rmux-reprobe"],
 		ver: version,
+		rmuxEpoch,
 	});
+}
+
+/** rmux extension: finish the epoch's complete native or ANSI first paint. */
+export function encodeTspRmuxReadyQuery(epoch: number, renderer: TspRmuxRenderer): string {
+	return encodeTspJson("q", { q: "rmux-ready", epoch, renderer });
 }
 
 /** One decoded APC message: verb, parameters and raw body. */
@@ -159,12 +172,38 @@ function isStringArray(value: unknown): value is string[] {
 	return Array.isArray(value) && value.every(item => typeof item === "string");
 }
 
+function isRmuxEpoch(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
 function decodeReply(value: Record<string, unknown>): TspReply | null {
 	if (value.r === "hello") {
 		if (typeof value.v !== "number" || typeof value.term !== "string" || !isStringArray(value.kinds)) return null;
+		if (
+			value.rmux !== undefined &&
+			(!isRecord(value.rmux) ||
+				value.rmux.broker !== 1 ||
+				!isRmuxEpoch(value.rmux.epoch) ||
+				typeof value.rmux.strictCredits !== "boolean")
+		) {
+			return null;
+		}
 		return value as TspHello;
 	}
 	if (value.r === "blobs") return isStringArray(value.have) ? (value as TspReply) : null;
+	if (value.r === "rmux-probe") {
+		if (
+			!isRmuxEpoch(value.epoch) ||
+			typeof value.native !== "boolean" ||
+			(value.accepted !== undefined && typeof value.accepted !== "boolean")
+		) {
+			return null;
+		}
+		return value as TspReply;
+	}
+	if (value.r === "rmux-ready") {
+		return isRmuxEpoch(value.epoch) && typeof value.accepted === "boolean" ? (value as TspReply) : null;
+	}
 	return null;
 }
 
@@ -189,6 +228,18 @@ const EVENT_REQUIRED: Readonly<Record<string, Readonly<Record<string, "string" |
 
 function decodeEvent(value: Record<string, unknown>): TspEvent | null {
 	if (typeof value.ev !== "string") return null;
+	if (value.ev === "rmux-view") {
+		if (
+			!isRmuxEpoch(value.epoch) ||
+			(value.reason !== "viewers" &&
+				value.reason !== "capabilities" &&
+				value.reason !== "geometry" &&
+				value.reason !== "ui")
+		) {
+			return null;
+		}
+		return value as TspEvent;
+	}
 	if (value.ev === "send") {
 		const { sf, id, text } = value;
 		if (typeof sf !== "string" || !sf || typeof id !== "string" || !id || typeof text !== "string") return null;

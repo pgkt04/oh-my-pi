@@ -18,6 +18,7 @@ import {
 	isInsideHerdr,
 	isInsideTerminalMultiplexer,
 } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import { canProbeTsp, classifyTerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 
 describe("isInsideHerdr", () => {
 	it("is true for HERDR_ENV=1", () => {
@@ -67,6 +68,64 @@ describe("isInsideTerminalMultiplexer", () => {
 	it("is false for client-only wmux CLI vars", () => {
 		expect(isInsideTerminalMultiplexer({ WMUX_CLI: "C:/wmux/wmux.exe" })).toBe(false);
 		expect(isInsideTerminalMultiplexer({ WMUX_PIPE: "\\\\.\\pipe\\wmux" })).toBe(false);
+	});
+});
+
+describe("rmux TSP probe permission", () => {
+	it("recognizes rmux as grid-owning even without its broker permission", () => {
+		for (const env of [{ TERM_PROGRAM: "rmux" }, { RMUX: "/tmp/rmux,1,0" }, { RMUX_PANE: "%1" }]) {
+			expect(classifyTerminalMultiplexer(env)).toBe("rmux");
+			expect(isInsideTerminalMultiplexer(env)).toBe(true);
+			expect(canProbeTsp(env)).toBe(false);
+		}
+	});
+
+	it("permits the explicit rmux broker with its configured tmux or screen terminfo", () => {
+		for (const TERM of ["tmux-256color", "screen-256color"]) {
+			const env = { TERM, TERM_PROGRAM: "rmux", RMUX_TSP: "1" };
+			expect(classifyTerminalMultiplexer(env)).toBe("rmux");
+			expect(canProbeTsp(env)).toBe(true);
+			// Probe permission must not enable direct-terminal rendering heuristics.
+			expect(shouldEnableSynchronizedOutputByDefault(env, "kitty")).toBe(false);
+		}
+	});
+
+	it("does not grant broker permission for an inherited marker or disabled broker", () => {
+		for (const env of [
+			{ RMUX_TSP: "1", TERM_PROGRAM: "tern" },
+			{ RMUX_TSP: "1" },
+			{ RMUX_TSP: "0", TERM_PROGRAM: "rmux" },
+			{ RMUX_TSP: "true", TERM_PROGRAM: "rmux" },
+		]) {
+			expect(canProbeTsp(env)).toBe(false);
+		}
+		expect(canProbeTsp({ TERM: "xterm-256color", TERM_PROGRAM: "tern" })).toBe(true);
+	});
+
+	it("rejects nested tmux, screen and zellij despite the inherited rmux broker marker", () => {
+		const broker = { RMUX_TSP: "1", TERM_PROGRAM: "rmux", TERM: "tmux-256color" };
+		for (const [inner, expected] of [
+			[{ TMUX: "/tmp/tmux,1,0" }, "tmux"],
+			[{ STY: "1.screen" }, "screen"],
+			[{ ZELLIJ: "0" }, "zellij"],
+			[{ TERM_PROGRAM: "tmux" }, "tmux"],
+			[{ TERM_PROGRAM: "screen" }, "screen"],
+			[{ TERM_PROGRAM: "zellij" }, "zellij"],
+			[{ TERM: "zellij" }, "zellij"],
+			[{ TERM_PROGRAM: undefined, TERM: "tmux-256color" }, "tmux"],
+			[{ TERM_PROGRAM: undefined, TERM: "screen-256color" }, "screen"],
+		] as const) {
+			const env = { ...broker, ...inner };
+			expect(canProbeTsp(env)).toBe(false);
+			// TERM-only fallback must still classify the inner grid owner.
+			expect(classifyTerminalMultiplexer(env)).toBe(expected);
+		}
+	});
+
+	it("keeps other unsupported mux endpoints closed to the rmux marker", () => {
+		for (const inner of [{ HERDR_ENV: "1" }, { CMUX_SURFACE_ID: "s1" }, { WMUX_SURFACE_ID: "s1" }]) {
+			expect(canProbeTsp({ RMUX_TSP: "1", TERM_PROGRAM: "rmux", ...inner })).toBe(false);
+		}
 	});
 });
 

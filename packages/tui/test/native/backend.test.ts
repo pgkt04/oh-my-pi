@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { NativeBackend, type NativeHost } from "@oh-my-pi/pi-tui/native/backend";
 import { card, md, node } from "@oh-my-pi/pi-tui/native/describe";
+import type { TspHello } from "@oh-my-pi/pi-tui/native/encode";
 import type { NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
 import { nativeComponentId } from "@oh-my-pi/pi-tui/native/reconcile";
 import { settleNative } from "@oh-my-pi/pi-tui/native/settle";
 import { isNativeRendering, onNativeRenderingChange } from "@oh-my-pi/pi-tui/native/state";
 import { type Component, Container } from "@oh-my-pi/pi-tui/tui";
 import type { TspOp } from "@oh-my-pi/pi-wire";
-import { ManualScheduler, TspHarness, TspTestTerminal } from "./tsp-harness";
+import { ManualScheduler, tspEvent, TspHarness, TspTestTerminal } from "./tsp-harness";
 
 class Probe implements Component {
 	current: NativeNode;
@@ -71,6 +73,138 @@ describe("native backend", () => {
 		h.stall(1);
 		expect(h.frames.length).toBe(sent + 1);
 		expect(h.byId(id)?.p).toEqual({ text: "one two three", stream: true });
+	});
+
+	for (const credits of [1, 2]) {
+		it(`holds broker frames indefinitely without a draw ack at credit limit ${credits}, then coalesces the pending model`, async () => {
+			const stream = new Probe(md("one", { stream: true }));
+			harness = await TspHarness.start(tui => tui.addChild(stream), { credits, autoAck: false, manualProbe: true });
+			const h = harness;
+			h.terminal.answerProbe({ rmux: { broker: 1, epoch: 17, strictCredits: true } });
+			h.flush();
+			const id = nativeComponentId(stream);
+			for (let i = 1; i <= credits; i++) {
+				stream.current = md(`one${" two".repeat(i)}`, { stream: true });
+				await h.render();
+			}
+			expect(h.frames).toHaveLength(credits);
+
+			// A detached broker retains draw debt, even beyond the ordinary lost-ack deadline.
+			h.stall(60_000);
+			stream.current = md("one while detached", { stream: true });
+			await h.render();
+			expect(h.frames).toHaveLength(credits);
+			expect(h.byId(id)?.p).not.toEqual({ text: "one while detached", stream: true });
+
+			const sent = h.frames.length;
+			const surface = h.terminal.surface!;
+			h.event({ ev: "ack", sf: surface, s: credits });
+			expect(h.frames).toHaveLength(sent + 1);
+			expect(h.frames.at(-1)).toMatchObject({ sf: surface, s: credits + 1 });
+			expect(h.byId(id)?.p).toEqual({ text: "one while detached", stream: true });
+			expect(h.errors).toEqual([]);
+
+			// A duplicate cumulative ack cannot grant another credit.
+			h.event({ ev: "ack", sf: surface, s: credits });
+			for (let i = 0; i < credits; i++) {
+				stream.current = md(`one returned${" again".repeat(i)}`, { stream: true });
+				await h.render();
+			}
+			expect(h.frames).toHaveLength(sent + credits);
+		});
+	}
+
+	it("discards switched surfaces and timers so late acknowledgements cannot release a replacement backend's credits", () => {
+		const terminal = new TspTestTerminal({ autoAck: false });
+		const scheduler = new ManualScheduler();
+		const stream = new Probe(md("before switch", { stream: true }));
+		const editor = new Probe(node("editor", { text: "draft", cursor: 5 }));
+		let fullscreen = false;
+		let requests = 0;
+		const host: NativeHost = {
+			terminal,
+			describeSurface: () => ({ main: [stream], dock: [] }),
+			overlays: () => (fullscreen ? [{ component: editor, options: { fullscreen: true }, focused: true }] : []),
+			focused: () => (fullscreen ? editor : null),
+			focusFromPointer: () => {},
+			requestRender: () => {
+				requests++;
+			},
+			appearanceChanged: () => {},
+			motionChanged: () => {},
+			invalidate: () => {},
+		};
+		const hello: TspHello = {
+			r: "hello",
+			v: 1,
+			term: "tern-test",
+			kinds: ["col", "md", "editor"],
+			credits: 1,
+		};
+		const old = new NativeBackend(host, hello, { scheduler });
+		let fresh: NativeBackend | undefined;
+		try {
+			old.start();
+			const inline = terminal.surface!;
+			fullscreen = true;
+			old.render();
+			const screen = terminal.surface!;
+			editor.current = node("editor", { text: "pending draft", cursor: 13 });
+			old.render(); // The ordinary endpoint arms its lost-ack wakeup.
+			const logged = terminal.log.length;
+			old.stop(false);
+			expect(terminal.log.slice(logged)).toEqual([
+				{ verb: "x", body: { id: screen, keep: false } },
+				{ verb: "x", body: { id: inline, keep: false } },
+			]);
+			expect(terminal.docs.size).toBe(0);
+			const stoppedRequests = requests;
+			old.handleInput(tspEvent({ ev: "ack", sf: screen, s: 1 }));
+			old.handleInput(tspEvent({ ev: "gone", ids: [inline] }));
+			old.handleInput(
+				tspEvent({
+					ev: "edit",
+					sf: screen,
+					id: nativeComponentId(editor),
+					from: 0,
+					to: 5,
+					text: "late",
+					cursor: 4,
+					len: 4,
+				}),
+			);
+			scheduler.advance(60_000);
+			scheduler.flush();
+			expect(requests).toBe(stoppedRequests);
+			expect(editor.events).toEqual([]);
+
+			fullscreen = false;
+			stream.current = md("after switch", { stream: true });
+			fresh = new NativeBackend(
+				host,
+				{ ...hello, rmux: { broker: 1, epoch: 18, strictCredits: true } },
+				{ scheduler },
+			);
+			fresh.start();
+			const replacement = terminal.surface!;
+			expect(replacement).not.toBe(inline);
+			expect(terminal.frames.at(-1)).toMatchObject({ sf: replacement, s: 1 });
+			const sent = terminal.frames.length;
+			stream.current = md("after switch and more", { stream: true });
+			fresh.render();
+			fresh.handleInput(tspEvent({ ev: "ack", sf: inline, s: 1 }));
+			fresh.handleInput(tspEvent({ ev: "ack", sf: screen, s: 1 }));
+			fresh.render();
+			expect(terminal.frames).toHaveLength(sent);
+			fresh.handleInput(tspEvent({ ev: "ack", sf: replacement, s: 1 }));
+			fresh.render();
+			expect(terminal.frames.at(-1)).toMatchObject({ sf: replacement, s: 2 });
+			expect(terminal.frames.at(-1)!.ops).toContainEqual(["text", nativeComponentId(stream), "append", " and more"]);
+			expect(terminal.errors).toEqual([]);
+		} finally {
+			old.stop(false);
+			fresh?.stop(false);
+		}
 	});
 
 	it("routes pointer events to the component that described the node, with its keypath and item key", async () => {

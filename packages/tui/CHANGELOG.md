@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the opt-in rmux TSP broker extension (`RMUX_TSP=1`, `TERM_PROGRAM=rmux`): generation-owned runtime probes and epoch/ready barriers switch the live UI between native surfaces and ANSI without resetting transcript, draft, dialogs, or undo. Nested unsupported multiplexers remain ANSI.
+
+### Fixed
+
+- Broker-native rendering honors strict credits while detached, rebuilds fresh surfaces after display-contract changes, and safely chunks parameter-shaped JSON text without corrupting the TSP payload.
+
 ## [18.7.0] - 2026-10-06
 
 ### Added

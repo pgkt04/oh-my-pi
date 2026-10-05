@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added optional rmux broker capabilities, generation epochs, and private `rmux-probe`, `rmux-view`, and `rmux-ready` TSP contracts for runtime renderer transitions.
+
 ## [18.5.1] - 2026-10-03
 
 ### Added

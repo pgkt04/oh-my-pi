@@ -905,10 +905,25 @@ export interface TspPalette {
 	name?: { dark?: string; light?: string };
 }
 
+/** rmux extension: a pane-wide renderer selected by the current viewer contract. */
+export type TspRmuxRenderer = "ansi" | "native";
+
+/** rmux extension: the source of a pane viewer-contract change. */
+export type TspRmuxViewReason = "viewers" | "capabilities" | "geometry" | "ui";
+
+/** rmux extension: confirms a broker endpoint, its current epoch and credit policy. */
+export interface TspRmuxBroker {
+	broker: 1;
+	epoch: number;
+	strictCredits: boolean;
+}
+
 /** Verb `q`. */
 export type TspQuery =
-	| { q: "hello"; v: readonly number[]; app: string; ver?: string; features?: readonly string[] }
-	| { q: "blobs"; ids: readonly string[] };
+	| { q: "hello"; v: readonly number[]; app: string; ver?: string; features?: readonly string[]; rmuxEpoch?: number }
+	| { q: "blobs"; ids: readonly string[] }
+	/** rmux extension: commits the complete first paint for the negotiated epoch. */
+	| { q: "rmux-ready"; epoch: number; renderer: TspRmuxRenderer };
 
 /** Verb `r`. */
 export type TspReply =
@@ -927,11 +942,18 @@ export type TspReply =
 			reduceMotion?: boolean;
 			/** The user's system reads a 12-hour clock (`false`: 24-hour); absent from older terminals. */
 			hour12?: boolean;
+			rmux?: TspRmuxBroker;
 	  }
-	| { r: "blobs"; have: readonly string[] };
+	| { r: "blobs"; have: readonly string[] }
+	/** rmux extension: supplies the probe epoch even when native capability is unavailable. */
+	| { r: "rmux-probe"; epoch: number; native: boolean; accepted?: boolean }
+	/** rmux extension: acknowledges or rejects the renderer's first-paint barrier. */
+	| { r: "rmux-ready"; epoch: number; accepted: boolean };
 
 /** Verb `e`: terminal → program events. */
 export type TspEvent =
+	/** rmux extension: requests a quiesced renderer re-probe without component input. */
+	| { ev: "rmux-view"; epoch: number; reason: TspRmuxViewReason }
 	| { ev: "ack"; sf: string; s: number }
 	| { ev: "resize"; sf?: string; cols: number; cell?: { w: number; h: number }; visible?: boolean }
 	| { ev: "theme"; dark: boolean }
