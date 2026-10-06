@@ -88,6 +88,28 @@ describe("UserMessageComponent magic-keyword highlighting", () => {
 		expect(countOccurrences(raw, "\x1b]133;D;0\x07")).toBe(1);
 	});
 
+	it("emits no OSC 133 prompt mark inside an rmux TSP broker pane", () => {
+		// The broker ends omp's TSP registration at OSC 133;A (a shell prompt), so
+		// a bubble repainted in ANSI must not carry one or omp never returns to native.
+		const keys = ["RMUX", "RMUX_TSP", "TERM_PROGRAM", "TMUX", "TERM"] as const;
+		const saved = keys.map(key => Bun.env[key]);
+		try {
+			delete Bun.env.TMUX;
+			Bun.env.RMUX = "/tmp/rmux-501/default,1,0";
+			Bun.env.RMUX_TSP = "1";
+			Bun.env.TERM_PROGRAM = "rmux";
+			Bun.env.TERM = "tmux-256color";
+			const raw = render("first line\nsecond line");
+			expect(Bun.stripANSI(raw)).toContain("second line");
+			expect(raw).not.toContain("\x1b]133;");
+		} finally {
+			keys.forEach((key, index) => {
+				if (saved[index] === undefined) delete Bun.env[key];
+				else Bun.env[key] = saved[index];
+			});
+		}
+	});
+
 	it("collapses image markers to identity-colored chip tokens in the rendered bubble", () => {
 		// Wire format stays `[Image #1, WxH]`; the bubble shows the composer's compact chip.
 		const raw = render("please inspect [Image #1, 800x600] before continuing");

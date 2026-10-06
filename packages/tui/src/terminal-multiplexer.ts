@@ -55,9 +55,18 @@ export function isInsideTerminalMultiplexer(env: NodeJS.ProcessEnv = Bun.env): b
 	return classifyTerminalMultiplexer(env) !== null;
 }
 
+/**
+ * True when omp runs in an rmux pane whose TSP broker is enabled. The broker
+ * keeps omp's TSP registration while omp paints ANSI rows, and ends it at a
+ * shell prompt (OSC 133;A), so a brokered omp must not emit prompt marks.
+ */
+export function isRmuxTspBroker(env: NodeJS.ProcessEnv = Bun.env): boolean {
+	return (
+		classifyTerminalMultiplexer(env) === "rmux" && env.RMUX_TSP === "1" && env.TERM_PROGRAM?.toLowerCase() === "rmux"
+	);
+}
+
 /** Permit APC detection only for a direct terminal or the explicit rmux broker endpoint. */
 export function canProbeTsp(env: NodeJS.ProcessEnv = Bun.env): boolean {
-	const multiplexer = classifyTerminalMultiplexer(env);
-	if (multiplexer === null) return true;
-	return multiplexer === "rmux" && env.RMUX_TSP === "1" && env.TERM_PROGRAM?.toLowerCase() === "rmux";
+	return classifyTerminalMultiplexer(env) === null || isRmuxTspBroker(env);
 }

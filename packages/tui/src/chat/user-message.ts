@@ -17,6 +17,7 @@ import {
 	skillChipStyle,
 } from "../prompt/composer-attachments";
 import { MODEL_MENTION_TAG_RE } from "../prompt/model-mention-syntax";
+import { isRmuxTspBroker } from "../terminal-multiplexer";
 import { expandKeyHint, fileHyperlink } from "../render";
 import { imageReferenceHyperlink } from "../prompt/image-references";
 import { highlightMagicKeywords } from "../prompt/magic-keywords";
@@ -131,6 +132,8 @@ export class UserMessageComponent extends Container implements ReactionTarget {
 	// never mutates the container's cached array.
 	#zoneSource: readonly string[] | undefined;
 	#zoneLines: string[] | undefined;
+	/** rmux's TSP broker reads OSC 133;A as "the program is gone"; brokered bubbles carry no zone. */
+	readonly #promptZones = !isRmuxTspBroker();
 	readonly #bgColor: (value: string) => string;
 	readonly #liveSteered: boolean;
 	readonly #synthetic: boolean;
@@ -291,8 +294,10 @@ export class UserMessageComponent extends Container implements ReactionTarget {
 		}
 		const wrapped = lines.slice();
 		if (this.#reaction !== undefined || this.#liveSteered) wrapped[0] = this.#badgeRow(width);
-		wrapped[0] = OSC133_ZONE_START + wrapped[0];
-		wrapped[wrapped.length - 1] = wrapped[wrapped.length - 1] + OSC133_ZONE_CLOSE;
+		if (this.#promptZones) {
+			wrapped[0] = OSC133_ZONE_START + wrapped[0];
+			wrapped[wrapped.length - 1] = wrapped[wrapped.length - 1] + OSC133_ZONE_CLOSE;
+		}
 		this.#zoneSource = lines;
 		this.#zoneLines = wrapped;
 		return wrapped;

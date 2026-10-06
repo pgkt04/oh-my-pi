@@ -9,6 +9,7 @@
 ### Fixed
 
 - Broker-native rendering honors strict credits while detached, rebuilds fresh surfaces after display-contract changes, and safely chunks parameter-shaped JSON text without corrupting the TSP payload.
+- Inside an rmux pane, omp now returns to the native Tern view after a viewer detaches and reattaches once the transcript holds a message: brokered user messages no longer carry OSC 133 prompt marks, which rmux reads as omp having exited.
 
 ## [18.7.0] - 2026-10-06
 
